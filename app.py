@@ -215,10 +215,12 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> N
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    requests.post(url, json=payload, timeout=15)
+    resp = requests.post(url, json=payload, timeout=15)
+    log.info(f"Ответ отправлен chat_id={chat_id}, telegram status={resp.status_code}")
 
 
 def reply_with_point_b(chat_id: int, driver: dict) -> None:
+    log.info(f"Ищу точку Б для {driver['name']} ({driver['park']})...")
     address, status = find_active_point_b(driver["park"], driver["id"])
     if not address:
         send_message(chat_id, f"Привет, {driver['name']}! Активного заказа с точкой Б сейчас не вижу.", POINT_B_KEYBOARD)
