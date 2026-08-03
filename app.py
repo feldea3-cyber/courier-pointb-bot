@@ -2,16 +2,23 @@
 Telegram-бот для курьеров (вебхук-версия): отдаёт адрес точки Б текущего
 активного заказа (Yandex Fleet API) по кнопке.
 
-Работает как постоянный веб-сервис (Flask + systemd), а не по расписанию —
-Telegram сам стучится на /webhook при каждом сообщении, ответ мгновенный.
-Живёт на RU VDS (176.113.82.49), а не на десктопе — независимо от того,
-включён ли компьютер Андрея.
+Работает как постоянный веб-сервис на Render.com (Flask+gunicorn) — Telegram
+сам стучится на /webhook при каждом сообщении, ответ мгновенный. Живёт в
+облаке, не на десктопе и не на RU-сервере (Telegram заблокирован в РФ на
+сетевом уровне — проверено, обычный fetch/curl до api.telegram.org с
+российского VDS не проходит).
 
-Все ключи — из переменных окружения (systemd EnvironmentFile), в коде их нет.
-Идентификация курьера — ТОЛЬКО через Telegram contact-share (см. пояснение
-в исходной локальной версии tools/courier_pointb_bot.py в репозитории
-my_claude_life) — номер нельзя подставить чужим.
+Все ключи — из переменных окружения (Render env vars), в коде их нет.
+Идентификация курьера — ТОЛЬКО через Telegram contact-share — номер нельзя
+подставить чужим.
+
+Диск на Render эфемерный (не переживает передеплой, возможно и долгий
+простой) — поэтому кэш индекса телефонов и подтверждённые курьеры
+дублируются в GitHub-репозиторий (state/*.json в этом же репозитории)
+через Contents API, как и heartbeat велобота. Локальный файл — быстрый
+путь на время жизни контейнера, GitHub — источник правды между запусками.
 """
+import base64
 import json
 import logging
 import os
@@ -29,11 +36,46 @@ log = logging.getLogger("courier_bot")
 
 FLEET_BASE_URL = "https://fleet-api.taxi.yandex.net"
 TELEGRAM_BASE_URL = "https://api.telegram.org"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = "feldea3-cyber/courier-pointb-bot"
 
 STATE_DIR = Path(__file__).resolve().parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 VERIFIED_PATH = STATE_DIR / "verified.json"
 PHONE_INDEX_PATH = STATE_DIR / "phone_index.json"
+
+
+def github_get_json(path: str):
+    if not GITHUB_TOKEN:
+        return None, None
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}", headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return None, None
+    data = resp.json()
+    content = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    return content, data["sha"]
+
+
+def github_put_json(path: str, content: dict, message: str) -> None:
+    if not GITHUB_TOKEN:
+        return
+    try:
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+        get_resp = requests.get(url, headers=headers, timeout=15)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+        body = {
+            "message": message,
+            "content": base64.b64encode(json.dumps(content, ensure_ascii=False).encode("utf-8")).decode("ascii"),
+            "branch": "main",
+        }
+        if sha:
+            body["sha"] = sha
+        put_resp = requests.put(url, headers=headers, json=body, timeout=15)
+        put_resp.raise_for_status()
+    except Exception as e:
+        log.warning(f"Не удалось сохранить {path} в GitHub (не критично): {e}")
 
 PARKS = {
     "dostavator": {
@@ -83,12 +125,17 @@ def save_json(path: Path, data) -> None:
 def get_verified() -> dict:
     global _verified_cache
     if _verified_cache is None:
-        _verified_cache = load_json(VERIFIED_PATH, {})
+        _verified_cache = load_json(VERIFIED_PATH, None)
+        if _verified_cache is None:
+            remote, _ = github_get_json("state/verified.json")
+            _verified_cache = remote if remote is not None else {}
+            save_json(VERIFIED_PATH, _verified_cache)
     return _verified_cache
 
 
 def save_verified(store: dict) -> None:
     save_json(VERIFIED_PATH, store)
+    github_put_json("state/verified.json", store, "Update verified couriers")
 
 
 def fleet_headers(creds: dict) -> dict:
@@ -155,6 +202,12 @@ def fetch_driver_phone_index() -> dict:
 def get_phone_index() -> dict:
     global _phone_index_cache, _phone_index_built_at
     cached = load_json(PHONE_INDEX_PATH, None)
+    if not cached:
+        # Локального диска нет (свежий контейнер после передеплоя/простоя) —
+        # прежде чем пересобирать индекс за минуты, проверить GitHub.
+        cached, _ = github_get_json("state/phone_index.json")
+        if cached:
+            save_json(PHONE_INDEX_PATH, cached)
     if cached and time.time() - cached.get("built_at", 0) < PHONE_INDEX_REFRESH_SECONDS:
         _phone_index_cache = cached["index"]
         _phone_index_built_at = cached["built_at"]
@@ -163,7 +216,9 @@ def get_phone_index() -> dict:
     index = fetch_driver_phone_index()
     _phone_index_cache = index
     _phone_index_built_at = time.time()
-    save_json(PHONE_INDEX_PATH, {"built_at": _phone_index_built_at, "index": index})
+    payload = {"built_at": _phone_index_built_at, "index": index}
+    save_json(PHONE_INDEX_PATH, payload)
+    github_put_json("state/phone_index.json", payload, "Update phone index cache")
     return index
 
 
