@@ -172,7 +172,13 @@ def normalize_phone(raw: str) -> str | None:
 
 
 def fetch_driver_phone_index() -> dict:
-    index = {}
+    # Один и тот же номер телефона может встречаться в ОБОИХ парках (например,
+    # у самого Андрея — старый рабочий профиль в одном парке и тестовый/неактивный
+    # в другом). Раньше запись просто перезатиралась последним совпадением по
+    # телефону — если тестовый профиль обрабатывался вторым, бот навсегда
+    # запоминал именно его и не видел реальные заказы. Теперь храним список ВСЕХ
+    # кандидатов на телефон и перебираем их при поиске точки Б.
+    index: dict[str, list[dict]] = {}
     for park_key, creds in PARKS.items():
         url = f"{FLEET_BASE_URL}/v1/parks/driver-profiles/list"
         offset = 0
@@ -188,7 +194,7 @@ def fetch_driver_phone_index() -> dict:
                     filter(None, [info.get("last_name"), info.get("first_name"), info.get("middle_name")])
                 )
                 for phone in info.get("phones", []):
-                    index[phone] = {"park": park_key, "id": driver_id, "name": name}
+                    index.setdefault(phone, []).append({"park": park_key, "id": driver_id, "name": name})
             total = data.get("total", 0)
             offset += len(items)
             if not items or offset >= total:
@@ -265,6 +271,18 @@ def find_active_point_b(park_key: str, driver_id: str) -> tuple[str | None, str 
     return route_points[-1].get("address"), best.get("status")
 
 
+def find_point_b_for_candidates(candidates: list[dict]) -> tuple[str | None, str | None]:
+    """Перебирает все профили (park+id), сопоставленные с телефоном курьера —
+    их может быть больше одного, если тот же номер зарегистрирован в обоих
+    парках. Возвращает первый найденный активный заказ (адрес может быть
+    None, если заказ активен, но точки маршрута ещё не подгрузились)."""
+    for cand in candidates:
+        address, status = find_active_point_b(cand["park"], cand["id"])
+        if status:
+            return address, status
+    return None, None
+
+
 def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
     url = f"{TELEGRAM_BASE_URL}/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
@@ -275,10 +293,22 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> N
 
 
 def reply_with_point_b(chat_id: int, driver: dict) -> None:
-    log.info(f"Ищу точку Б для {driver['name']} ({driver['park']})...")
-    address, status = find_active_point_b(driver["park"], driver["id"])
-    if not address:
+    # driver["candidates"] — новый формат (список профилей на телефон). Старый
+    # формат (один закэшированный park/id из verified.json до этого фикса)
+    # оставляем работать через фолбэк, чтобы не ронять уже верифицированных
+    # курьеров, у которых телефон не дублировался между парками.
+    candidates = driver.get("candidates") or [{"park": driver["park"], "id": driver["id"]}]
+    log.info(f"Ищу точку Б для {driver['name']} среди {len(candidates)} профиля(ей) ({[c['park'] for c in candidates]})...")
+    address, status = find_point_b_for_candidates(candidates)
+    if not status:
         send_message(chat_id, f"Привет, {driver['name']}! Активного заказа с точкой Б сейчас не вижу.", POINT_B_KEYBOARD)
+        return
+    if not address:
+        send_message(
+            chat_id,
+            f"Заказ есть (статус: {status}), но адрес ещё не пришёл от Яндекса — попробуй ещё раз через минуту.",
+            POINT_B_KEYBOARD,
+        )
         return
     send_message(chat_id, f"Точка Б: {address}\n(статус заказа: {status})", POINT_B_KEYBOARD)
 
@@ -295,10 +325,11 @@ def handle_message(message: dict) -> None:
             return
         phone = normalize_phone(contact.get("phone_number", ""))
         phone_index = get_phone_index()
-        driver = phone_index.get(phone) if phone else None
-        if not driver:
+        candidates = phone_index.get(phone) if phone else None
+        if not candidates:
             send_message(chat_id, "Не нашёл курьера с таким номером в базе. Напиши Андрею.")
             return
+        driver = {"name": candidates[0]["name"], "candidates": candidates}
         with _lock:
             verified = get_verified()
             verified[chat_key] = driver
