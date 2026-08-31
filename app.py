@@ -179,14 +179,28 @@ def fetch_driver_phone_index() -> dict:
     # запоминал именно его и не видел реальные заказы. Теперь храним список ВСЕХ
     # кандидатов на телефон и перебираем их при поиске точки Б.
     index: dict[str, list[dict]] = {}
+    park_profile_counts: dict[str, int] = {}
     for park_key, creds in PARKS.items():
         url = f"{FLEET_BASE_URL}/v1/parks/driver-profiles/list"
         offset = 0
         limit = 500
+        park_profiles = 0
         while True:
             body = {"query": {"park": {"id": creds["park_id"]}}, "limit": limit, "offset": offset}
             data = fleet_post(url, creds, body)
             items = data.get("driver_profiles", [])
+            total = data.get("total", 0)
+            # Fleet API иногда отдаёт 200 с пустой/короткой страницей посреди
+            # честной пагинации (не 429/5xx, поэтому fleet_post не ретраит) —
+            # если это происходит РАНЬШЕ, чем набранный offset дошёл до total,
+            # значит страница "просела", а не закончилась честно. Раньше это
+            # тихо обрывало парк на середине и КЭШИРОВАЛОСЬ как полный —
+            # запись Андрея однажды тихо пропала на 3+ недели именно так.
+            if not items and offset < total:
+                raise RuntimeError(
+                    f"{park_key}: пустая страница на offset={offset} при total={total} — "
+                    f"похоже на просевший ответ Fleet API, не считаю индекс полным"
+                )
             for item in items:
                 info = item.get("driver_profile", {})
                 driver_id = info.get("id")
@@ -195,12 +209,19 @@ def fetch_driver_phone_index() -> dict:
                 )
                 for phone in info.get("phones", []):
                     index.setdefault(phone, []).append({"park": park_key, "id": driver_id, "name": name})
-            total = data.get("total", 0)
+                park_profiles += 1
             offset += len(items)
             if not items or offset >= total:
                 break
             time.sleep(1.0)
-        log.info(f"  {park_key}: профилей с телефонами добавлено в индекс")
+        park_profile_counts[park_key] = park_profiles
+        log.info(f"  {park_key}: {park_profiles} профилей с телефонами добавлено в индекс")
+    # Живой парк реалистично не бывает пустым — 0 профилей означает сбой
+    # сбора (например, весь fetch для парка упал в самом начале), а не
+    # реальное отсутствие водителей. Не даём такому результату закэшироваться.
+    empty_parks = [p for p, c in park_profile_counts.items() if c == 0]
+    if empty_parks:
+        raise RuntimeError(f"Подозрительно пустые парки в индексе: {empty_parks} — не сохраняю")
     log.info(f"Индекс телефонов построен: {len(index)} записей")
     return index
 
